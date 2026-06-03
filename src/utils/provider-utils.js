@@ -88,7 +88,7 @@ export const PROVIDER_MAPPINGS = [
         defaultCheckModel: 'grok-4.1-mini',
         displayName: 'Grok Web',
         needsProjectId: false,
-        urlKeys: ['GROK_BASE_URL', 'GROK_CF_CLEARANCE', 'GROK_USER_AGENT', 'GROK_STATSIG_ID']
+        urlKeys: ['GROK_BASE_URL', 'GROK_CF_CLEARANCE', 'GROK_CF_BM', 'GROK_USER_AGENT', 'GROK_STATSIG_ID']
     }
 ];
 

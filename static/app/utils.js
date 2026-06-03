@@ -217,6 +217,7 @@ function getFieldLabel(key) {
         'CODEX_OAUTH_CREDS_FILE_PATH': t('modal.provider.field.oauthPath'),
         'GROK_COOKIE_TOKEN': t('modal.provider.field.ssoToken'),
         'GROK_CF_CLEARANCE': t('modal.provider.field.cfClearance'),
+        'GROK_CF_BM': t('modal.provider.field.cfBm'),
 
         'GROK_USER_AGENT': t('modal.provider.field.userAgent'),
         'GEMINI_BASE_URL': 'Gemini Base URL',
@@ -438,22 +439,28 @@ function getProviderTypeFields(providerType) {
                 placeholder: 'sso cookie token'
             },
             {
+                id: 'GROK_BASE_URL',
+                label: `${t('modal.provider.field.grokBaseUrl')} <span class="optional-tag">${t('config.optional')}</span>`,
+                type: 'text',
+                placeholder: 'https://grok.com'
+            },
+            {
                 id: 'GROK_CF_CLEARANCE',
                 label: `${t('modal.provider.field.cfClearance')} <span class="optional-tag">${t('config.optional')}</span>`,
                 type: 'text',
                 placeholder: 'cf_clearance cookie value'
             },
             {
+                id: 'GROK_CF_BM',
+                label: `${t('modal.provider.field.cfBm')} <span class="optional-tag">${t('config.optional')}</span>`,
+                type: 'text',
+                placeholder: '__cf_bm cookie value'
+            },
+            {
                 id: 'GROK_USER_AGENT',
                 label: `${t('modal.provider.field.userAgent')} <span class="optional-tag">${t('config.optional')}</span>`,
                 type: 'text',
                 placeholder: 'Mozilla/5.0 ...'
-            },
-            {
-                id: 'GROK_BASE_URL',
-                label: `${t('modal.provider.field.grokBaseUrl')} <span class="optional-tag">${t('config.optional')}</span>`,
-                type: 'text',
-                placeholder: 'https://grok.com'
             },
             {
                 id: 'GROK_STATSIG_ID',
