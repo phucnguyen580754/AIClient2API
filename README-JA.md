@@ -75,7 +75,7 @@
       </a>
     </td>
     <td width="75%" align="left" valign="middle">
-      Thanks to VisionCoder for supporting this project. <a href="https://visioncoder.cn">VisionCoder Developer Platform</a> is a reliable and efficient API relay service provider, offering access to mainstream AI models such as Claude Code, Codex, and Gemini. It helps developers and teams integrate AI capabilities more easily and improve productivity. Additionally, VisionCoder now offers retail channels for Claude Max 200 and GPT Pro 200 premium accounts, providing users with instant access to top-tier AI computing power and features.
+      Thanks to VisionCoder for supporting this project. <a href="https://visioncoder.cn">VisionCoder Developer Platform</a> is a reliable and efficient API relay service provider, offering access to mainstream AI models such as Claude Code, Codex, and Gemini. It helps developers and teams integrate AI capabilities more easily and improve productivity. Additionally, VisionCoder now offers retail channels for <strong>Claude Max 200 and GPT Pro 200 premium accounts</strong>, providing users with instant access to top-tier AI computing power and features.
     </td>
   </tr>
   <tr>
