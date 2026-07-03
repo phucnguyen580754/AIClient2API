@@ -675,6 +675,8 @@ const translations = {
         'providers.stat.errorCount': '错误次数',
         'providers.auth.generate': '生成授权',
         'providers.auth.importToken': '导入 Token',
+        'providers.register': '网站注册',
+        'providers.register.title': '打开提供商网站注册页',
 
         // Modal Provider Manager
         'modal.provider.manage': '管理 {type} 提供商配置',
@@ -1877,6 +1879,8 @@ const translations = {
         'providers.stat.errorCount': 'Error Count',
         'providers.auth.generate': 'Gen Auth',
         'providers.auth.importToken': 'Import Token',
+        'providers.register': 'Register',
+        'providers.register.title': 'Open provider registration page',
 
         // Modal Provider Manager
         'modal.provider.manage': 'Manage {type} Provider Config',

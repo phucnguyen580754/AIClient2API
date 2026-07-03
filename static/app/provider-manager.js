@@ -429,7 +429,8 @@ function renderProviders(providers, supportedProviders = []) {
                     <span class="provider-type-text">${displayName}</span>
                 </div>
                 <div class="provider-header-right">
-                    ${generateAddGroupButton(providerType)}
+                    ${configMap[providerType]?.registerUrl ? '' : generateAddGroupButton(providerType)}
+                    ${generateRegisterButton(configMap[providerType])}
                     ${generateAuthButton(providerType)}
                     <div class="provider-status ${statusClass}">
                         <i class="fas fa-${statusIcon}"></i>
@@ -530,6 +531,13 @@ function renderProviders(providers, supportedProviders = []) {
             authBtn.addEventListener('click', (e) => {
                 e.stopPropagation(); // 阻止事件冒泡到父元素
                 handleGenerateAuthUrl(providerType);
+            });
+        }
+
+        const registerBtn = providerDiv.querySelector('.provider-register-btn');
+        if (registerBtn) {
+            registerBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
             });
         }
     });
@@ -781,6 +789,26 @@ function generateAuthButton(providerType) {
             <i class="fas fa-key"></i>
             <span data-i18n="providers.auth.generate">${t('providers.auth.generate')}</span>
         </button>
+    `;
+}
+
+/**
+ * 生成提供商网站注册链接
+ * @param {Object} providerConfig - 提供商配置
+ * @returns {string} 链接HTML
+ */
+function generateRegisterButton(providerConfig) {
+    if (!providerConfig?.registerUrl) {
+        return '';
+    }
+
+    const safeUrl = escapeHtml(providerConfig.registerUrl);
+
+    return `
+        <a class="provider-register-btn" href="${safeUrl}" target="_blank" rel="noopener noreferrer" title="${t('providers.register.title')}">
+            <i class="fas fa-external-link-alt"></i>
+            <span data-i18n="providers.register">${t('providers.register')}</span>
+        </a>
     `;
 }
 

@@ -83,7 +83,8 @@ function getBaseProviderConfigs() {
         { 
             id: 'atlascloud', 
             name: 'AtlasCloud', 
-            icon: 'fa-cloud'
+            icon: 'fa-cloud',
+            registerUrl: 'https://www.atlascloud.ai/console/coding-plan'
         },
     ];
 }
