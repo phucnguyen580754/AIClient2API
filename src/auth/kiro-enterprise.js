@@ -82,8 +82,8 @@ const MAX_REFRESH_RETRIES = 3;
 const REFRESH_BACKOFF_BASE_MS = 1000;
 
 /** Preferred loopback port range for the enterprise SSO callback server. */
-const CALLBACK_PORT_START = 19876;
-const CALLBACK_PORT_END = 19880;
+const CALLBACK_PORT_START = 3128;
+const CALLBACK_PORT_END = 3128;
 
 /** Enterprise credential storage — matches the kiro-oauth.js directory pattern. */
 const CREDENTIALS_DIR = 'configs/kiro';
@@ -623,140 +623,203 @@ h1{color:${isSuccess?'#4caf50':'#f44336'};margin-top:0}p{color:#666}</style></he
 
 /**
  * Create the loopback HTTP server for the enterprise SSO callback.
- * Handles both legs: first leg (Kiro portal callback) and second leg (Microsoft callback).
+ * Two-leg flow:
+ *   Leg 1: Kiro portal redirects here with enterprise descriptor (issuer_url, client_id, scopes)
+ *          → OIDC discovery → redirect browser to Microsoft login
+ *   Leg 2: Microsoft redirects to /oauth/callback with authorization code
+ *          → exchange at Microsoft token endpoint → save credential
  */
 function createEnterpriseCallbackServer(port, session, options = {}) {
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
       try {
-        const url = new URL(req.url, `http://127.0.0.1:${port}`);
+        const reqUrl = new URL(req.url, `http://127.0.0.1:${port}`);
+        const path = reqUrl.pathname;
+        const q = Object.fromEntries(reqUrl.searchParams.entries());
 
-        if (!['/oauth/callback', '/authenticate-success'].includes(url.pathname)) {
-          res.writeHead(204);
+        // Only GET requests expected for OAuth redirects
+        if (req.method !== 'GET') {
+          res.writeHead(405);
           res.end();
           return;
         }
 
-        // -- First leg: Kiro portal callback --
-        if (session.leg === 'firstLeg') {
-          const issuerUrl = url.searchParams.get('issuer_url');
+        // --- Enterprise leg-1: portal callback with IdP descriptor ---
+        // The portal redirects to the base redirect_uri (root path /)
+        // with the enterprise IdP descriptor when it detects an enterprise email.
+        const isEnterpriseDescriptor =
+          path !== '/oauth/callback' &&
+          (q.login_option === 'external_idp' || q.issuer_url);
 
-          if (!issuerUrl) {
+        if (isEnterpriseDescriptor) {
+          // Single-shot: ignore if leg-2 already in flight
+          if (session.leg2Started) {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+
+          const issuerUrl = q.issuer_url;
+          const clientId = q.client_id;
+          const scopes = q.scopes || 'openid profile email offline_access';
+          const loginHint = q.login_hint;
+
+          if (!clientId) {
             res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(generateEnterpriseResponsePage(false, 'Enterprise IdP not detected. Please select "Microsoft 365 / Enterprise SSO" in the Kiro portal.'));
+            res.end(generateEnterpriseResponsePage(false, 'Enterprise IdP descriptor missing client_id.'));
             cleanupEnterpriseSession();
             return;
           }
 
-          logger.info(`${LOG_PREFIX} Enterprise IdP detected, initiating second leg`);
-
-          try {
-            const issuerValidation = validateExternalIdpEndpoint(issuerUrl);
-            if (!issuerValidation.valid) {
-              res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-              res.end(generateEnterpriseResponsePage(false, `Issuer validation failed: ${issuerValidation.reason}`));
-              cleanupEnterpriseSession();
-              return;
-            }
-
-            const clientId = url.searchParams.get('client_id') || options.clientId || '';
-            const scopes = url.searchParams.get('scopes') || options.scopes || 'openid profile email offline_access';
-
-            // OIDC discovery
-            const discovery = await oidcDiscover(issuerUrl);
-            session.tokenEndpoint = discovery.tokenEndpoint;
-
-            // Fresh PKCE for second leg
-            session.codeVerifierEnterprise = generateCodeVerifier();
-            session.codeChallengeEnterprise = generateCodeChallenge(session.codeVerifierEnterprise);
-
-            const microsoftAuthUrl = buildMicrosoftAuthUrl(
-              issuerUrl, clientId,
-              `http://127.0.0.1:${port}/oauth/callback`,
-              session.codeChallengeEnterprise, session.state, scopes,
-              url.searchParams.get('login_hint') || undefined,
-            );
-
-            session.leg = 'enterprise';
-            session.clientId = clientId;
-            session.scopes = scopes;
-            session.issuerUrl = issuerUrl;
-
-            res.writeHead(302, { Location: microsoftAuthUrl });
-            res.end();
-          } catch (err) {
-            logger.error(`${LOG_PREFIX} Enterprise leg error: ${err.message}`);
-            res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(generateEnterpriseResponsePage(false, `Enterprise authentication error: ${err.message}`));
+          // Validate issuer URL
+          const issuerValidation = validateExternalIdpEndpoint(issuerUrl);
+          if (!issuerValidation.valid) {
+            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(generateEnterpriseResponsePage(false, `Issuer validation failed: ${issuerValidation.reason}`));
             cleanupEnterpriseSession();
+            return;
           }
+
+          // OIDC discovery
+          let authEndpoint, tokenEndpoint;
+          try {
+            const discovery = await oidcDiscover(issuerUrl);
+            authEndpoint = discovery.authorizationEndpoint;
+            tokenEndpoint = discovery.tokenEndpoint;
+          } catch (err) {
+            logger.error(`${LOG_PREFIX} OIDC discovery failed: ${err.message}`);
+            res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(generateEnterpriseResponsePage(false, `OIDC discovery failed: ${err.message}`));
+            cleanupEnterpriseSession();
+            return;
+          }
+
+          // Fresh PKCE for enterprise leg-2
+          const leg2Verifier = generateCodeVerifier();
+          const leg2Challenge = generateCodeChallenge(leg2Verifier);
+          const leg2State = generateState();
+          const leg2RedirectUri = `http://localhost:${port}/oauth/callback`;
+
+          // Save leg-2 context
+          session.leg2 = {
+            verifier: leg2Verifier,
+            state: leg2State,
+            tokenEndpoint,
+            issuerUrl,
+            clientId,
+            scopes,
+            redirectUri: leg2RedirectUri,
+          };
+          session.leg2Started = true;
+
+          // Build Microsoft auth URL using discovered authorization endpoint
+          // (Kiro-Go passes authEndpoint directly, not derived from issuer URL)
+          const microsoftAuthUrl = (() => {
+            const params = new URLSearchParams({
+              client_id: clientId,
+              response_type: 'code',
+              redirect_uri: leg2RedirectUri,
+              scope: scopes,
+              code_challenge: leg2Challenge,
+              code_challenge_method: 'S256',
+              response_mode: 'query',
+              state: leg2State,
+            });
+            if (loginHint) params.set('login_hint', loginHint);
+            return `${authEndpoint}?${params.toString()}`;
+          })();
+
+          res.writeHead(302, { Location: microsoftAuthUrl });
+          logger.info(`${LOG_PREFIX} Redirecting browser to Microsoft login`);
+          res.end();
           return;
         }
 
-        // -- Second leg: Microsoft callback --
-        if (session.leg === 'enterprise') {
-          const code = url.searchParams.get('code');
-          const state = url.searchParams.get('state');
-          const errorParam = url.searchParams.get('error');
+        // --- Enterprise leg-2: Microsoft callback at /oauth/callback ---
+        if (path === '/oauth/callback') {
+          const leg2 = session.leg2;
 
-          if (errorParam) {
-            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(generateEnterpriseResponsePage(false, `Microsoft login failed: ${url.searchParams.get('error_description') || errorParam}`));
-            cleanupEnterpriseSession();
+          if (!leg2) {
+            // No leg-2 in flight — likely a stray callback, ignore silently
+            res.writeHead(204);
+            res.end();
             return;
           }
 
-          // CSRF check
-          if (state !== session.state) {
-            logger.warn(`${LOG_PREFIX} State mismatch — possible CSRF`);
+          const code = q.code;
+          const state = q.state;
+          const errorParam = q.error;
+
+          // State must match leg-2 state
+          if (!state || state !== leg2.state) {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+
+          if (errorParam) {
             res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(generateEnterpriseResponsePage(false, 'Security validation failed. Please try again.'));
+            res.end(generateEnterpriseResponsePage(false, `Microsoft login failed: ${q.error_description || errorParam}`));
             cleanupEnterpriseSession();
             return;
           }
 
           if (!code) {
-            res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(generateEnterpriseResponsePage(false, 'Authorization code missing'));
-            cleanupEnterpriseSession();
+            res.writeHead(204);
+            res.end();
             return;
           }
 
-          session.leg = 'exchanging';
-          logger.info(`${LOG_PREFIX} Exchanging authorization code`);
+          logger.info(`${LOG_PREFIX} Exchanging authorization code at Microsoft token endpoint`);
 
           try {
-            const redirectUri = `http://127.0.0.1:${port}/oauth/callback`;
             const tokenResult = await exchangeExternalIdpCode(
-              session.tokenEndpoint, code, session.codeVerifierEnterprise, redirectUri, session.clientId,
+              leg2.tokenEndpoint, code, leg2.verifier,
+              leg2.redirectUri, leg2.clientId,
             );
 
+            // Resolve profile ARN
             let profileArn = '';
-            try { profileArn = await resolveProfileArn(tokenResult.accessToken, session.region || 'us-east-1', true); }
-            catch (e) { logger.warn(`${LOG_PREFIX} Profile ARN resolution failed: ${e.message}`); }
+            try {
+              profileArn = await resolveProfileArn(tokenResult.accessToken, session.region || 'us-east-1', true);
+            } catch (e) {
+              logger.warn(`${LOG_PREFIX} Profile ARN resolution failed: ${e.message}`);
+            }
 
             const expiresAt = tokenResult.expiresIn ? Date.now() + tokenResult.expiresIn * 1000 : 0;
             const credential = {
-              authMethod: 'external_idp', provider: 'AzureAD',
-              tokenEndpoint: session.tokenEndpoint, issuerUrl: session.issuerUrl,
-              scopes: session.scopes, clientId: session.clientId,
+              authMethod: 'external_idp',
+              provider: 'AzureAD',
+              tokenEndpoint: leg2.tokenEndpoint,
+              issuerUrl: leg2.issuerUrl,
+              scopes: leg2.scopes,
+              clientId: leg2.clientId,
               accessToken: tokenResult.accessToken,
               refreshToken: tokenResult.refreshToken || '',
-              expiresAt, profileArn, region: session.region || 'us-east-1',
+              expiresAt,
+              profileArn,
+              region: session.region || 'us-east-1',
             };
 
             const credPath = await saveEnterpriseCredential(credential);
 
+            // Auto-link
             try {
               const { autoLinkProviderConfigs } = await import('../services/service-manager.js');
               await autoLinkProviderConfigs(CONFIG, { onlyCurrentCred: true, credPath });
-            } catch (e) { logger.warn(`${LOG_PREFIX} Auto-linking failed: ${e.message}`); }
+            } catch (e) {
+              logger.warn(`${LOG_PREFIX} Auto-linking failed: ${e.message}`);
+            }
 
+            // Broadcast success
             try {
               const { broadcastEvent } = await import('../services/ui-manager.js');
               broadcastEvent('oauth_success', {
-                provider: 'claude-kiro-oauth', credPath, relativePath: credPath,
-                timestamp: new Date().toISOString(), authMethod: 'external_idp',
+                provider: 'claude-kiro-oauth',
+                credPath,
+                relativePath: credPath,
+                timestamp: new Date().toISOString(),
+                authMethod: 'external_idp',
               });
             } catch { /* non-critical */ }
 
@@ -774,11 +837,10 @@ function createEnterpriseCallbackServer(port, session, options = {}) {
           return;
         }
 
-        // Unexpected leg state
-        logger.warn(`${LOG_PREFIX} Unexpected callback in leg state: ${session.leg}`);
-        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(generateEnterpriseResponsePage(false, 'Unexpected callback state.'));
-        cleanupEnterpriseSession();
+        // --- Not a recognized callback path ---
+        // This could be a favicon.ico request or other noise. Ignore silently.
+        res.writeHead(204);
+        res.end();
       } catch (err) {
         logger.error(`${LOG_PREFIX} Callback handler error: ${err.message}`);
         try { res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(generateEnterpriseResponsePage(false, 'Server error')); } catch { /* ignore */ }
@@ -804,9 +866,9 @@ function cleanupEnterpriseSession() {
  * Initiate the enterprise SSO login flow.
  *
  * 1. Cancels any active SSO session (single active session rule)
- * 2. Generates PKCE / anti-CSRF state
+ * 2. Generates PKCE verifier + anti-CSRF state
  * 3. Starts loopback server (preferred range 19876-19880, fallback OS-assigned)
- * 4. Opens browser to Kiro portal
+ * 4. Opens browser to Kiro portal with PKCE params (matching Kiro-Go pattern)
  * 5. Callback handler manages both legs of the flow
  *
  * @param {object} options
@@ -817,7 +879,13 @@ export async function startEnterpriseSSO(options = {}) {
   if (activeEnterpriseSession) cancelActiveEnterpriseSession();
 
   const region = options.region || 'us-east-1';
-  const session = { codeVerifier: generateCodeVerifier(), state: generateState(), leg: 'firstLeg', region, startedAt: Date.now() };
+  const session = {
+    codeVerifier: generateCodeVerifier(),
+    state: generateState(),
+    leg: 'portal',
+    region,
+    startedAt: Date.now(),
+  };
 
   let server, port;
 
@@ -830,7 +898,7 @@ export async function startEnterpriseSSO(options = {}) {
       catch (err) { if (err.code === 'EADDRINUSE') continue; throw err; }
     }
     if (!server) {
-      logger.warn(`${LOG_PREFIX} Port range exhausted, falling back to OS-assigned`);
+      logger.warn(`${LOG_PREFIX} Port range exhausted, fallback to OS-assigned`);
       server = await createEnterpriseCallbackServer(0, session, options);
       port = server.address().port;
     }
@@ -838,12 +906,6 @@ export async function startEnterpriseSSO(options = {}) {
 
   session.server = server;
   session.redirectPort = port;
-  session.tokenEndpoint = '';
-  session.clientId = '';
-  session.scopes = '';
-  session.issuerUrl = '';
-  session.codeVerifierEnterprise = '';
-  session.codeChallengeEnterprise = '';
 
   session._timeoutHandle = setTimeout(() => {
     logger.warn(`${LOG_PREFIX} Enterprise SSO session timed out`);
@@ -852,11 +914,32 @@ export async function startEnterpriseSSO(options = {}) {
 
   activeEnterpriseSession = session;
 
-  const kiroUrl = `https://app.kiro.dev/signin?redirect_uri=http://127.0.0.1:${port}`;
-  logger.info(`${LOG_PREFIX} Opening browser: ${kiroUrl}`);
-  try { await redirectBrowser(kiroUrl); } catch { logger.warn(`${LOG_PREFIX} Failed to open browser automatically`); }
+  // Build portal URL with ALL required parameters matching Kiro-Go reference.
+  // - state: anti-CSRF, echoed back by portal
+  // - code_challenge: PKCE challenge (for the Cognito social leg)
+  // - code_challenge_method: S256
+  // - redirect_uri: loopback listener (localhost so the browser resolves it)
+  // - redirect_from: KiroIDE — client tag the portal expects
+  const codeChallenge = generateCodeChallenge(session.codeVerifier);
+  const redirectUri = `http://localhost:${port}`;
+  const portalUrl = `https://app.kiro.dev/signin?state=${encodeURIComponent(session.state)}&code_challenge=${codeChallenge}&code_challenge_method=S256&redirect_uri=${encodeURIComponent(redirectUri)}&redirect_from=KiroIDE`;
 
-  return { success: true, authUrl: kiroUrl, port, state: session.state, authInfo: { provider: 'claude-kiro-oauth', authMethod: 'external_idp', port, state: session.state }, message: 'Browser opened to Kiro portal.' };
+  logger.info(`${LOG_PREFIX} Opening browser: ${portalUrl}`);
+  try { await redirectBrowser(portalUrl); } catch { logger.warn(`${LOG_PREFIX} Failed to open browser automatically`); }
+
+  return {
+    success: true,
+    authUrl: portalUrl,
+    port,
+    state: session.state,
+    authInfo: {
+      provider: 'claude-kiro-oauth',
+      authMethod: 'external_idp',
+      port,
+      state: session.state,
+    },
+    message: 'Browser opened to Kiro portal sign-in. Sign in with your Microsoft 365 enterprise account.',
+  };
 }
 
 // ---------------------------------------------------------------------------
