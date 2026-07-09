@@ -35,7 +35,7 @@ const OAUTH_CLIENT_SECRET = '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';
 const DEFAULT_USER_AGENT = 'antigravity/1.104.0 darwin/arm64';
 const REFRESH_SKEW = 3000; // 3000秒（50分钟）提前刷新Token
 
-const ANTIGRAVITY_SYSTEM_PROMPT = `You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**`;
+const ANTIGRAVITY_SYSTEM_PROMPT = `[Antigravity API Proxy]`;
 
 
 // Thinking 配置相关常量
@@ -63,6 +63,7 @@ const ANTIGRAVITY_CLIENT_MODEL_THINKING_LEVEL = {
     'gemini-3-pro-high': 'high',
     'gemini-3-pro-preview': 'high',
     'gemini-3.5-flash-high': 'high',
+    'gemini-3-flash-agent': 'high',
     'gemini-3.1-pro-low': 'low',
     'gemini-3-pro-low': 'low',
     'gemini-3.5-flash-low': 'low'
@@ -280,6 +281,90 @@ function modelSupportsThinking(modelName) {
 }
 
 /**
+ * [FIX-400] Antigravity session-level thought_signature store.
+ * Maps sessionId -> { nextIdx, signatures: string[] }.
+ *
+ * 背景: ClaudeConverter 把 Anthropic 格式转 Gemini 格式时,会在 functionCall
+ * part 上加 hack 常量 "skip_thought_signature_validator"。Google 的 Antigravity
+ * backend 不接受这个值,直接 400。
+ *
+ * 修复: 在 antigravity-core 这里接管 — 从 Google 真实 response 中抽取
+ * thought_signature,按 sessionId 存起来; 下一轮请求时按位置注入回去,覆盖掉
+ * hack 常量。这样 Anthropic 格式的 round-trip 不需要承载 signature 字段。
+ */
+const ANTIGRAVITY_SIGNATURE_STORE = new Map();
+const ANTIGRAVITY_SIGNATURE_STORE_MAX = 2000; // 防内存爆炸
+
+// 进程级代际标识 — 每次重启生成不同的值。附加到 sessionId 尾部，
+// 确保服务重启后 Google 将同一对话视为新 session，避免服务器端
+// functionCall 位置计数器残留导致的 thought_signature 不匹配。
+const _antigravityGeneration = Date.now();
+
+function storeAntigravitySessionSignatures(sessionId, newSigs) {
+    if (!sessionId || !Array.isArray(newSigs) || newSigs.length === 0) return;
+    let entry = ANTIGRAVITY_SIGNATURE_STORE.get(sessionId);
+    if (!entry) {
+        entry = { nextIdx: 0, signatures: [] };
+        ANTIGRAVITY_SIGNATURE_STORE.set(sessionId, entry);
+        // LRU-ish: drop oldest if over cap
+        if (ANTIGRAVITY_SIGNATURE_STORE.size > ANTIGRAVITY_SIGNATURE_STORE_MAX) {
+            const firstKey = ANTIGRAVITY_SIGNATURE_STORE.keys().next().value;
+            ANTIGRAVITY_SIGNATURE_STORE.delete(firstKey);
+        }
+    }
+    for (const sig of newSigs) {
+        if (typeof sig === 'string' && sig.length > 0 && sig !== 'skip_thought_signature_validator') {
+            entry.signatures.push(sig);
+        }
+    }
+}
+
+function injectAntigravitySessionSignatures(sessionId, contents) {
+    if (!sessionId || !Array.isArray(contents)) return;
+    const entry = ANTIGRAVITY_SIGNATURE_STORE.get(sessionId);
+    if (!entry || entry.signatures.length === 0) return;
+
+    let idx = entry.nextIdx;
+    for (const content of contents) {
+        if (!content || typeof content !== 'object') continue;
+        if (!Array.isArray(content.parts)) continue;
+        const role = content.role;
+        if (role !== 'model' && role !== 'assistant') continue;
+
+        for (const part of content.parts) {
+            if (!part || typeof part !== 'object') continue;
+            // Override ALL functionCall parts (including placeholders)
+            // with real signatures from the store when available
+            if (part.functionCall && idx < entry.signatures.length) {
+                part.thoughtSignature = entry.signatures[idx];
+                idx++;
+            }
+        }
+    }
+    entry.nextIdx = idx;
+}
+
+/** 从 Gemini response 中抽出 thought_signature 列表(保持 parts 顺序) */
+function extractAntigravitySignaturesFromResponse(responseData) {
+    const sigs = [];
+    if (!responseData || typeof responseData !== 'object') return sigs;
+    const candidates = responseData.candidates;
+    if (!Array.isArray(candidates)) return sigs;
+    for (const cand of candidates) {
+        const parts = cand?.content?.parts;
+        if (!Array.isArray(parts)) continue;
+        for (const part of parts) {
+            if (!part || typeof part !== 'object') continue;
+            const sig = part.thoughtSignature || part.thought_signature;
+            if (typeof sig === 'string' && sig.length > 0) {
+                sigs.push(sig);
+            }
+        }
+    }
+    return sigs;
+}
+
+/**
  * 生成随机请求ID
  * @returns {string}
  */
@@ -423,6 +508,42 @@ function normalizeAntigravityThinking(modelName, payload, isClaudeModel) {
 }
 
 /**
+ * 移除 model/assistant role 消息中的所有 functionCall parts。
+ *
+ * Google Antigravity 要求每个 functionCall 携带有效的 cryptographic
+ * thought_signature（由 Google 模型自己生成）。ClaudeConverter 把 Anthropic
+ * tool_use 转成 functionCall 时产生的签名是 hack 常量或占位符，Google 均会
+ * 以 400 拒绝。最干净的修复：不让这些 functionCall 到达 Google。
+ *
+ * 移除后不影响模型理解：functionResponse（工具结果）已保留上下文。
+ * @param {*} node - 任意对象/数组
+ */
+function normalizeAntigravityThoughtSignatures(node) {
+    if (!node || typeof node !== 'object') return;
+
+    if (Array.isArray(node)) {
+        for (const item of node) normalizeAntigravityThoughtSignatures(item);
+        return;
+    }
+
+    // If this is a model/assistant role content with parts, strip functionCall parts
+    const role = node.role;
+    if ((role === 'model' || role === 'assistant') && Array.isArray(node.parts)) {
+        for (let i = node.parts.length - 1; i >= 0; i--) {
+            const part = node.parts[i];
+            if (part && typeof part === 'object' && part.functionCall) {
+                node.parts.splice(i, 1);
+            }
+        }
+        return;
+    }
+
+    for (const key of Object.keys(node)) {
+        normalizeAntigravityThoughtSignatures(node[key]);
+    }
+}
+
+/**
  * 将 Gemini 格式请求转换为 Antigravity 格式
  * @param {string} modelName - 模型名称
  * @param {Object} payload - 请求体
@@ -432,6 +553,11 @@ function normalizeAntigravityThinking(modelName, payload, isClaudeModel) {
 function geminiToAntigravity(modelName, payload, projectId) {
     // 深拷贝请求体,避免修改原始对象
     let template = JSON.parse(JSON.stringify(payload));
+
+    // [FIX-400] remove functionCall parts from model/assistant role messages
+    // because we cannot generate valid Google cryptographic thought_signatures
+    // for Claude-converted tool_use blocks.
+    normalizeAntigravityThoughtSignatures(template);
 
     const isClaudeModel = isClaude(modelName);
     const isImgModel = isImageModel(modelName);
@@ -458,8 +584,17 @@ function geminiToAntigravity(modelName, payload, projectId) {
         if (!template.request) {
             template.request = {};
         }
-        // 设置会话ID - 使用稳定的会话ID
-        template.request.sessionId = generateStableSessionID(template);
+        // 设置会话ID - 使用稳定的会话ID + 进程代际后缀,
+        // 确保重启后 Google 视为新 session。
+        const stableSessionId = generateStableSessionID(template);
+        template.request.sessionId = stableSessionId + '-g' + _antigravityGeneration;
+
+        // [FIX-400] 保险: 如果 store 中有该 session 的真实 thought_signature
+        // （从之前 response 捕获的），仍尝试注入。normalize 已移除 functionCall parts，
+        // 所以此步通常不生效，但在某些非标准场景下可能有用。
+        if (Array.isArray(template.request.contents)) {
+            injectAntigravitySessionSignatures(template.request.sessionId, template.request.contents);
+        }
     }
 
     if (!template.request) {
@@ -855,21 +990,17 @@ function ensureRolesInContents(requestBody, modelName) {
     const useAntigravity = isGemini3 || name.includes('claude');
 
     if (useAntigravity) {
-        // 让 AI 忽略 Antigravity 提示词
-        const parts = [
-            { text: ANTIGRAVITY_SYSTEM_PROMPT },
-            { text: `Please ignore following [ignore]${ANTIGRAVITY_SYSTEM_PROMPT}[/ignore]` }
-        ];
-        
-        // 如果有原始系统提示词，追加到 parts 中
+        // Không inject identity của Antigravity — dùng system prompt gốc của
+        // coding agent (vd Claude Code prompt + CLAUDE.md). Antigravity chỉ
+        // là tầng proxy/transport, không phải một AI identity riêng.
         if (originalSystemPromptText) {
-            parts.push({ text: originalSystemPromptText });
+            requestBody.systemInstruction = {
+                role: 'user',
+                parts: [{ text: originalSystemPromptText }]
+            };
+        } else {
+            delete requestBody.systemInstruction;
         }
-        
-        requestBody.systemInstruction = {
-            role: 'user',
-            parts: parts
-        };
     } else if (originalSystemPromptText) {
         // 对于其他模型，如果有原始系统提示词，保留它
         requestBody.systemInstruction = {
@@ -1350,7 +1481,23 @@ export class AntigravityApiService {
             };
 
             this._applySidecar(requestOptions);
+            // [DEBUG-TOOLS-400] temporary: log body for non-200 statuses
             const res = await this.authClient.request(requestOptions);
+            if (res.status !== 200) {
+                logger.info('[DEBUG-TOOLS-400] non-stream status', res.status, 'body:',
+                    JSON.stringify(body, null, 2));
+            }
+            // [FIX-400] capture real thought_signatures from the response
+            // so future turns in the same session can re-attach them
+            try {
+                const sessionId = body?.request?.sessionId;
+                if (sessionId && res.data) {
+                    const sigs = extractAntigravitySignaturesFromResponse(res.data);
+                    if (sigs.length > 0) {
+                        storeAntigravitySessionSignatures(sessionId, sigs);
+                    }
+                }
+            } catch (_) { /* non-fatal */ }
             return res.data;
         } catch (error) {
             const status = error.response?.status;
@@ -1455,9 +1602,14 @@ export class AntigravityApiService {
             };
 
             this._applySidecar(requestOptions);
+            // [DEBUG-TOOLS-400] temporary: dump body when status != 200
+            logger.info('[DEBUG-TOOLS-400] upstream URL:', requestOptions.url);
+            logger.info('[DEBUG-TOOLS-400] request body:', JSON.stringify(body, null, 2));
             const res = await this.authClient.request(requestOptions);
 
             if (res.status !== 200) {
+                logger.info('[DEBUG-TOOLS-400] upstream returned status', res.status, 'for body:',
+                    JSON.stringify(body, null, 2));
                 let errorBody = '';
                 try {
                     for await (const chunk of res.data) {
@@ -1469,7 +1621,33 @@ export class AntigravityApiService {
                 throw upstreamError;
             }
 
-            yield* this.parseSSEStream(res.data);
+            // [FIX-400] 在 streaming 过程中累积 parts,stream 结束后抽取
+            // thought_signature 并存到 session store,供后续 turn 注入。
+            const sessionId = body?.request?.sessionId;
+            const collectedParts = [];
+            for await (const chunk of this.parseSSEStream(res.data)) {
+                const parts = chunk?.candidates?.[0]?.content?.parts;
+                if (Array.isArray(parts)) {
+                    for (const p of parts) {
+                        if (p && typeof p === 'object') collectedParts.push(p);
+                    }
+                }
+                yield chunk;
+            }
+            if (sessionId && collectedParts.length > 0) {
+                try {
+                    const sigs = [];
+                    for (const p of collectedParts) {
+                        const sig = p.thoughtSignature || p.thought_signature;
+                        if (typeof sig === 'string' && sig.length > 0) {
+                            sigs.push(sig);
+                        }
+                    }
+                    if (sigs.length > 0) {
+                        storeAntigravitySessionSignatures(sessionId, sigs);
+                    }
+                } catch (_) { /* non-fatal */ }
+            }
         } catch (error) {
             const status = error.response?.status;
             const errorCode = error.code;
