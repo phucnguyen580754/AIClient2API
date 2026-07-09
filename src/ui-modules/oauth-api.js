@@ -13,7 +13,9 @@ import {
     batchImportGrokCliTokensStream,
     batchImportKiroRefreshTokensStream,
     importAwsCredentials,
-    batchImportGrokTokensStream
+    batchImportGrokTokensStream,
+    importEnterpriseCredential,
+    detectEnterpriseAuthAlias
 } from '../auth/oauth-handlers.js';
 import { normalizeCodexExternalCredentials } from '../auth/codex-import-normalizer.js';
 
@@ -53,7 +55,7 @@ export async function handleGenerateAuthUrl(req, res, currentConfig, providerTyp
             authInfo = result.authInfo;
         } else if (providerType === 'claude-kiro-oauth') {
             // Kiro OAuth 支持多种认证方式
-            // options.method 可以是: 'google' | 'github' | 'builder-id'
+            // options.method 可以是: 'google' | 'github' | 'builder-id' | 'external_idp'
             const result = await handleKiroOAuth(currentConfig, options);
             authUrl = result.authUrl;
             authInfo = result.authInfo;
@@ -220,7 +222,63 @@ export async function handleBatchImportKiroTokens(req, res) {
             }));
             return true;
         }
-        
+
+        // Detect enterprise credential import (US3): if first entry is an object with enterprise auth method
+        const firstEntry = refreshTokens[0];
+        if (firstEntry && typeof firstEntry === 'object' && detectEnterpriseAuthAlias(firstEntry.authMethod)) {
+            logger.info(`[Kiro Batch Import] Detected enterprise credential import, processing ${refreshTokens.length} credential(s)...`);
+
+            res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no'
+            });
+
+            const sendSSE = (event, data) => {
+                if (!res.writableEnded && !res.destroyed) {
+                    try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch { return false; }
+                }
+                return true;
+            };
+
+            sendSSE('start', { total: refreshTokens.length });
+
+            let successCount = 0;
+            let failedCount = 0;
+            const details = [];
+
+            for (let i = 0; i < refreshTokens.length; i++) {
+                const credential = refreshTokens[i];
+                const result = await importEnterpriseCredential(credential);
+                if (result.success) {
+                    successCount++;
+                    details.push({ index: i + 1, success: true, path: result.path });
+                } else {
+                    failedCount++;
+                    details.push({ index: i + 1, success: false, error: result.error });
+                }
+                sendSSE('progress', {
+                    index: i + 1,
+                    total: refreshTokens.length,
+                    current: details[details.length - 1],
+                    successCount,
+                    failedCount
+                });
+            }
+
+            sendSSE('complete', {
+                success: true,
+                total: refreshTokens.length,
+                successCount,
+                failedCount,
+                details
+            });
+
+            res.end();
+            return true;
+        }
+
         logger.info(`[Kiro Batch Import] Starting batch import of ${refreshTokens.length} tokens with SSE...`);
         
         // 设置 SSE 响应头

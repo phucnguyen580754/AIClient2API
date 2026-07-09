@@ -8,6 +8,7 @@ import { broadcastEvent } from '../services/ui-manager.js';
 import { autoLinkProviderConfigs } from '../services/service-manager.js';
 import { CONFIG } from '../core/config-manager.js';
 import { getProxyConfigForProvider } from '../utils/proxy-utils.js';
+import { detectEnterpriseAuthAlias, startEnterpriseSSO } from './kiro-enterprise.js';
 
 /**
  * Kiro OAuth 配置（支持多种认证方式）
@@ -223,6 +224,8 @@ export async function handleKiroOAuth(currentConfig, options = {}) {
             return handleKiroSocialAuth('Github', currentConfig, options);
         case 'builder-id':
             return handleKiroBuilderIDDeviceCode(currentConfig, options);
+        case 'external_idp':
+            return startEnterpriseSSO(options);
         default:
             throw new Error(`不支持的认证方式: ${method}`);
     }

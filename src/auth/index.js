@@ -28,6 +28,24 @@ export {
     importAwsCredentials
 } from './kiro-oauth.js';
 
+// Kiro Enterprise Auth
+export {
+    startEnterpriseSSO,
+    refreshEnterpriseToken,
+    detectEnterpriseAuthAlias,
+    validateExternalIdpEndpoint,
+    getExternalIdpAllowList,
+    parseJwtPayload,
+    extractEmailFromIdToken,
+    oidcDiscover,
+    exchangeExternalIdpCode,
+    buildMicrosoftAuthUrl,
+    resolveProfileArn,
+    saveEnterpriseCredential,
+    importEnterpriseCredential,
+    validateEnterpriseCredential
+} from './kiro-enterprise.js';
+
 // iFlow OAuth
 export {
     handleIFlowOAuth,

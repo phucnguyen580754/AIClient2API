@@ -19,6 +19,7 @@ import {
 import { configureAxiosProxy, configureTLSSidecar, isTLSSidecarEnabledForProvider } from '../../utils/proxy-utils.js';
 import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog, getNormalizedErrorResponseText, buildHttpErrorReason, normalizeProviderErrorMessage, createEmptyUpstreamResponseError } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
+import { refreshEnterpriseToken } from '../../auth/kiro-enterprise.js';
 
 const KIRO_THINKING = {
     MIN_BUDGET_TOKENS: 1024,
@@ -791,6 +792,8 @@ async loadCredentials() {
         applyCredential('profileArn');
         applyCredential('region');
         applyCredential('idcRegion');
+        applyCredential('tokenEndpoint');
+        applyCredential('scopes');
 
         if (!this.region) {
             this.region = this.idcRegion || 'us-east-1';
@@ -900,6 +903,65 @@ async saveCredentialsToFile(filePath, newData) {
             if (!this.authMethod) {
                 this.authMethod = isSocialAuth ? KIRO_CONSTANTS.AUTH_METHOD_SOCIAL : 'builder-id';
                 logger.warn(`[Kiro Auth] authMethod missing in credentials. Inferred ${this.authMethod} from available fields.`);
+            }
+
+            // Enterprise (external_idp) token refresh via Microsoft OIDC token endpoint
+            if (this.authMethod === 'external_idp') {
+                if (!this.tokenEndpoint) {
+                    throw new Error('Enterprise token refresh requires tokenEndpoint in credential.');
+                }
+                const credential = {
+                    tokenEndpoint: this.tokenEndpoint,
+                    refreshToken: this.refreshToken,
+                    clientId: this.clientId,
+                    scopes: this.scopes,
+                };
+                try {
+                    const result = await refreshEnterpriseToken(credential);
+                    this.accessToken = result.accessToken;
+                    if (result.refreshToken) {
+                        this.refreshToken = result.refreshToken;
+                    }
+                    const expiresAt = new Date(Date.now() + (result.expiresIn || 3600) * 1000).toISOString();
+                    this.expiresAt = expiresAt;
+                    logger.info('[Kiro Auth] Enterprise access token refreshed successfully');
+
+                    const updatedTokenData = {
+                        accessToken: this.accessToken,
+                        refreshToken: this.refreshToken,
+                        expiresAt: expiresAt,
+                    };
+                    if (this.profileArn) {
+                        updatedTokenData.profileArn = this.profileArn;
+                    }
+                    await saveCredentialsToFile(tokenFilePath, updatedTokenData);
+
+                    const poolManager = getProviderPoolManager();
+                    if (poolManager && this.uuid) {
+                        poolManager.resetProviderRefreshStatus(this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API, this.uuid);
+                    }
+                    return;
+                } catch (err) {
+                    // Auth errors (invalid_grant, 401, 403) — disable account, no retry
+                    if (err.message.includes('invalidated') || err.message.includes('Auth error')) {
+                        logger.error('[Kiro Auth] Enterprise credential invalidated, disabling account:', err.message);
+                        this.accessToken = null;
+                        this.authMethod = null;
+                        const updatedTokenData = {
+                            accessToken: null,
+                            refreshToken: null,
+                            expiresAt: new Date(0).toISOString(),
+                            disabled: true,
+                            disabledReason: `Enterprise auth credential invalidated: ${err.message}`,
+                        };
+                        if (this.profileArn) {
+                            updatedTokenData.profileArn = this.profileArn;
+                        }
+                        await saveCredentialsToFile(tokenFilePath, updatedTokenData);
+                        throw err;
+                    }
+                    throw err;
+                }
             }
 
             let refreshUrl = this.refreshUrl;

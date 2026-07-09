@@ -2361,6 +2361,13 @@ function showKiroAuthMethodSelector(providerType) {
                             <div style="font-size: 12px; color: #666;" data-i18n="oauth.kiro.awsBuilderDesc">${t('oauth.kiro.awsBuilderDesc')}</div>
                         </div>
                     </button>
+                    <button class="auth-method-btn" data-method="external_idp" style="display: flex; align-items: center; gap: 12px; padding: 16px; border: 2px solid #e0e0e0; border-radius: 8px; background: white; cursor: pointer; transition: all 0.2s;">
+                        <i class="fab fa-microsoft" style="font-size: 24px; color: #00a4ef;"></i>
+                        <div style="text-align: left;">
+                            <div style="font-weight: 600; color: #333;" data-i18n="oauth.kiro.enterprise">${t('oauth.kiro.enterprise')}</div>
+                            <div style="font-size: 12px; color: #666;" data-i18n="oauth.kiro.enterpriseDesc">${t('oauth.kiro.enterpriseDesc')}</div>
+                        </div>
+                    </button>
                     <button class="auth-method-btn" data-method="aws-import" style="display: flex; align-items: center; gap: 12px; padding: 16px; border: 2px solid #e0e0e0; border-radius: 8px; background: white; cursor: pointer; transition: all 0.2s;">
                         <i class="fas fa-cloud-upload-alt" style="font-size: 24px; color: #ff9900;"></i>
                         <div style="text-align: left;">
@@ -4019,8 +4026,8 @@ function showAuthModal(authUrl, authInfo) {
             </div>
         `;
     } else if (authInfo.provider === 'claude-kiro-oauth') {
-        const methodDisplay = authInfo.authMethod === 'builder-id' ? 'AWS Builder ID' : `Social (${authInfo.socialProvider || 'Google'})`;
-        const methodAccount = authInfo.authMethod === 'builder-id' ? 'AWS Builder ID' : authInfo.socialProvider || 'Google';
+        const methodDisplay = authInfo.authMethod === 'builder-id' ? 'AWS Builder ID' : authInfo.authMethod === 'external_idp' ? 'Microsoft 365 / Enterprise SSO' : `Social (${authInfo.socialProvider || 'Google'})`;
+        const methodAccount = authInfo.authMethod === 'builder-id' ? 'AWS Builder ID' : authInfo.authMethod === 'external_idp' ? 'Microsoft 365' : authInfo.socialProvider || 'Google';
         instructionsHtml = `
             <div class="auth-instructions">
                 <h4 data-i18n="oauth.modal.steps">${t('oauth.modal.steps')}</h4>

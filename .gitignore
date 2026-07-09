@@ -21,3 +21,10 @@ AGENTS.md
 src/plugins-user/
 
 /.codegraph/
+.env
+.env.local
+.env.*.local
+*.log
+dist/
+build/
+*.tmp
