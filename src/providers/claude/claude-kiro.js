@@ -45,6 +45,15 @@ const KIRO_CONSTANTS = {
     CONTENT_TYPE_JSON: 'application/json',
     ACCEPT_JSON: 'application/json',
     AUTH_METHOD_SOCIAL: 'social',
+    AUTH_METHOD_EXTERNAL_IDP: 'external_idp',
+    // Kiro Enterprise (Microsoft Entra ID) tokens must be sent with
+    // TokenType: EXTERNAL_IDP and an X-Amz-Target header to be accepted
+    // by the Amazon Q backend (q.<region>.amazonaws.com). Without these
+    // headers, the backend rejects the Microsoft JWT with HTTP 403
+    // "The bearer token included in the request is invalid" — even
+    // though the token is valid for Microsoft Entra ID itself.
+    TOKEN_TYPE_EXTERNAL_IDP: 'EXTERNAL_IDP',
+    X_AMZ_TARGET_GENERATE_ASSISTANT_RESPONSE: 'AmazonCodeWhispererService.GenerateAssistantResponse',
     CHAT_TRIGGER_TYPE_MANUAL: 'MANUAL',
     ORIGIN_AI_EDITOR: 'AI_EDITOR',
     TOTAL_CONTEXT_TOKENS: 200000, // Claude Sonnet 4.5 actual context is 200K
@@ -53,6 +62,36 @@ const KIRO_CONSTANTS = {
 const KIRO_MAX_TOOL_NAME_LENGTH = 64;
 let kiroThrottleQueue = Promise.resolve();
 let kiroLastRequestStartedAt = 0;
+
+/**
+ * Build the standard header set for a Kiro / Amazon Q backend call.
+ * For external_idp (Microsoft Entra ID) credentials, we MUST send
+ * `TokenType: EXTERNAL_IDP` — the Amazon Q backend rejects Microsoft-issued
+ * JWTs with HTTP 403 "The bearer token included in the request is invalid"
+ * otherwise. The X-Amz-Target header is only needed for JSON-RPC style
+ * endpoints (e.g. ListAvailableProfiles) — REST-style endpoints
+ * (generateAssistantResponse, getUsageLimits) identify the operation
+ * via the URL path, so we omit X-Amz-Target by default. Pass
+ * `amzTarget` explicitly to include it.
+ *
+ * @param {string} token - Bearer token (Microsoft Entra ID or AWS SSO)
+ * @param {string} authMethod - 'social' | 'builder-id' | 'external_idp'
+ * @param {string} [amzTarget] - Optional X-Amz-Target value for JSON-RPC ops
+ * @returns {Object} headers
+ */
+function buildKiroAuthHeaders(token, authMethod, amzTarget) {
+    const headers = {
+        'Authorization': `Bearer ${token}`,
+        'amz-sdk-invocation-id': `${uuidv4()}`,
+    };
+    if (authMethod === KIRO_CONSTANTS.AUTH_METHOD_EXTERNAL_IDP) {
+        headers['TokenType'] = KIRO_CONSTANTS.TOKEN_TYPE_EXTERNAL_IDP;
+        if (amzTarget) {
+            headers['X-Amz-Target'] = amzTarget;
+        }
+    }
+    return headers;
+}
 
 function shortenKiroToolName(name) {
     const rawName = String(name || '');
@@ -1864,10 +1903,11 @@ async saveCredentialsToFile(filePath, newData) {
 
         try {
             const token = this.accessToken; // Use the already initialized token
-            const headers = {
-                'Authorization': `Bearer ${token}`,
-                'amz-sdk-invocation-id': `${uuidv4()}`,
-            };
+            // [FIX-403-EXTERNAL-IDP] For Microsoft Entra ID (Kiro Enterprise SSO) tokens,
+            // buildKiroAuthHeaders adds `TokenType: EXTERNAL_IDP`. The Amazon Q backend
+            // at q.<region>.amazonaws.com rejects Microsoft-issued JWTs with HTTP 403
+            // "The bearer token included in the request is invalid" without this header.
+            const headers = buildKiroAuthHeaders(token, this.authMethod);
 
             // 当 model 以 kiro-amazonq 开头时，使用 amazonQUrl，否则使用 baseUrl
             const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
@@ -2457,10 +2497,9 @@ async saveCredentialsToFile(filePath, newData) {
         const toolNameMaps = requestData._kiroToolNameMaps;
 
         const token = this.accessToken;
-        const headers = {
-            'Authorization': `Bearer ${token}`,
-            'amz-sdk-invocation-id': `${uuidv4()}`,
-        };
+        // [FIX-403-EXTERNAL-IDP] See callApi above — buildKiroAuthHeaders adds
+        // `TokenType: EXTERNAL_IDP` for Microsoft Entra ID (Kiro Enterprise SSO) tokens.
+        const headers = buildKiroAuthHeaders(token, this.authMethod);
 
         const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
 
@@ -3550,10 +3589,12 @@ async saveCredentialsToFile(filePath, newData) {
         const { osName, nodeVersion } = getSystemRuntimeInfo();
 
         const headers = {
-            'Authorization': `Bearer ${this.accessToken}`,
+            // [FIX-403-EXTERNAL-IDP] buildKiroAuthHeaders adds TokenType: EXTERNAL_IDP
+            // for Microsoft Entra ID tokens, then we layer on the rest of the
+            // usage-limits-specific headers.
+            ...buildKiroAuthHeaders(this.accessToken, this.authMethod),
             'x-amz-user-agent': `aws-sdk-js/1.0.34 KiroIDE-${kiroVersion}-${machineId}`,
             'user-agent': `aws-sdk-js/1.0.34 ua/2.1 os/${osName} lang/js md/nodejs#${nodeVersion} api/codewhispererstreaming#1.0.34 m/E KiroIDE-${kiroVersion}-${machineId}`,
-            'amz-sdk-invocation-id': uuidv4(),
             'amz-sdk-request': 'attempt=1; max=1',
             'Connection': 'close'
         };
